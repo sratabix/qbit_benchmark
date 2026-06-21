@@ -1,0 +1,191 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags:
+      - "v*"
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  ci:
+    name: Lint & build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "$out"
+            echo "::error::gofmt found issues; run 'gofmt -w .'"
+            exit 1
+          fi
+
+      - run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+
+      - name: Cross-build linux/amd64+arm64
+        run: |
+          mkdir -p dist
+          ver="dev-${GITHUB_SHA::7}"
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch \
+              go build -trimpath -ldflags "-s -w -X main.version=${ver}" \
+              -o dist/qbit_benchmark_linux_${arch} .
+          done
+
+      - name: Scan with VirusTotal
+        if: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/v') }}
+        uses: crazy-max/ghaction-virustotal@v5
+        with:
+          vt_api_key: ${{ secrets.VT_API_KEY }}
+          request_rate: 4
+          files: |
+            dist/qbit_benchmark_linux_amd64
+            dist/qbit_benchmark_linux_arm64
+
+      - name: Upload dev build
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: qbit_benchmark-dev-${{ github.sha }}
+          path: dist/qbit_benchmark_linux_*
+          retention-days: 14
+
+  docker:
+    name: Docker build (no push)
+    needs: ci
+    runs-on: ubuntu-latest
+    if: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/v') }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  publish-dev:
+    name: Publish :dev image
+    needs: ci
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/qbit_benchmark:dev
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  publish:
+    name: Publish image
+    needs: ci
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/qbit_benchmark
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: Publish binaries
+    needs: ci
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build binaries
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH=$arch CGO_ENABLED=0 \
+              go build -trimpath -ldflags "-s -w -X main.version=${{ github.ref_name }}" \
+              -o dist/qbit_benchmark_linux_${arch} .
+          done
+      - name: Scan with VirusTotal
+        uses: crazy-max/ghaction-virustotal@v5
+        with:
+          vt_api_key: ${{ secrets.VT_API_KEY }}
+          request_rate: 4
+          files: |
+            dist/qbit_benchmark_linux_amd64
+            dist/qbit_benchmark_linux_arm64
+      - name: VirusTotal summary
+        id: vtsum
+        run: |
+          {
+            echo "results<<EOF"
+            echo "### VirusTotal scans"
+            for f in dist/qbit_benchmark_linux_amd64 dist/qbit_benchmark_linux_arm64; do
+              sha=$(sha256sum "$f" | cut -d ' ' -f1)
+              echo "- [$(basename "$f")](https://www.virustotal.com/gui/file/$sha)"
+            done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          body: ${{ steps.vtsum.outputs.results }}
+          files: dist/*
